@@ -748,16 +748,21 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
             }
             guard let self = self else { return }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if statusCode == 401 || statusCode == 403 || statusCode == 404 {
-                // Auth/resource-gone — purge config so we stop trying.
-                self.uploadQueueSerial.async {
-                    self.uploadUrl = nil
-                    let defaults = UserDefaults.standard
-                    defaults.removeObject(forKey: self.uploadUrlKey)
-                    defaults.removeObject(forKey: self.uploadPendingKey)
+            // 4xx = client error — don't queue for retry, the body will never
+            // become acceptable. 401/403/404 additionally purge config so we
+            // stop trying entirely until JS reconfigures.
+            if statusCode >= 400 && statusCode < 500 {
+                if statusCode == 401 || statusCode == 403 || statusCode == 404 {
+                    self.uploadQueueSerial.async {
+                        self.uploadUrl = nil
+                        let defaults = UserDefaults.standard
+                        defaults.removeObject(forKey: self.uploadUrlKey)
+                        defaults.removeObject(forKey: self.uploadPendingKey)
+                    }
                 }
                 return
             }
+            // 5xx or network failure — retry via the persistent queue.
             if error != nil || statusCode < 200 || statusCode >= 300 {
                 self.uploadQueueSerial.async {
                     self.enqueuePendingUpload(payload)

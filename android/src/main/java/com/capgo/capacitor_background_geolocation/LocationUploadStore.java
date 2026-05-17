@@ -136,14 +136,23 @@ final class LocationUploadStore {
             }
             int responseCode = connection.getResponseCode();
             Logger.debug("Location upload POST finished with response code: " + responseCode);
-            if (responseCode == 401 || responseCode == 403 || responseCode == 404) {
-                // Auth or resource-gone — retrying won't help and stale config would
-                // keep firing every minIntervalMs. Auto-purge so subsequent fixes are
-                // no-ops until the JS layer reconfigures with fresh credentials.
-                Logger.error("Location upload rejected (" + responseCode + "), clearing upload config", null);
-                clear(context);
+
+            // 4xx = client error — retrying won't change the outcome. Drop the
+            // payload silently so WorkManager doesn't queue exponential retries
+            // for what is fundamentally a bad request. The 401/403/404 subset
+            // additionally purges the stored config so subsequent fixes are
+            // no-ops until JS reconfigures with fresh credentials.
+            if (responseCode >= 400 && responseCode < 500) {
+                if (responseCode == 401 || responseCode == 403 || responseCode == 404) {
+                    Logger.error("Location upload rejected (" + responseCode + "), clearing upload config", null);
+                    clear(context);
+                } else {
+                    Logger.error("Location upload rejected (" + responseCode + "), dropping payload", null);
+                }
                 return;
             }
+
+            // 5xx or network-level oddity — return retriable so WorkManager backs off.
             if (responseCode < HttpURLConnection.HTTP_OK || responseCode >= HttpURLConnection.HTTP_MULT_CHOICE) {
                 throw new IOException("Location upload POST failed with response code: " + responseCode);
             }
