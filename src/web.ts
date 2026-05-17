@@ -172,11 +172,18 @@ export class BackgroundGeolocationWeb extends WebPlugin implements BackgroundGeo
       return;
     }
     this.uploadLastSentAt = now;
-    const body = JSON.stringify({
+    // Match the compact KIVO schema emitted by the native pipelines
+    // (lat/lng/heading) so the backend validator accepts uploads from web
+    // too. Drop fields KIVO doesn't need (altitude, time, simulated, etc).
+    const payload: Record<string, unknown> = {
       ...this.uploadCommonPayload,
-      ...location,
-      enqueuedAt: now,
-    });
+      lat: location.latitude,
+      lng: location.longitude,
+      reason: 'native',
+    };
+    if (typeof location.accuracy === 'number') payload.accuracy = location.accuracy;
+    if (typeof location.speed === 'number' && location.speed >= 0) payload.speed = location.speed;
+    if (typeof location.bearing === 'number' && location.bearing >= 0) payload.heading = location.bearing;
     void fetch(this.uploadUrl, {
       method: 'POST',
       headers: {
@@ -184,7 +191,7 @@ export class BackgroundGeolocationWeb extends WebPlugin implements BackgroundGeo
         'Content-Type': 'application/json',
         ...this.uploadHeaders,
       },
-      body,
+      body: JSON.stringify(payload),
     }).catch(() => undefined);
   }
 
