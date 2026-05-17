@@ -1,5 +1,8 @@
 # node files
-dist
+# `dist/` is intentionally NOT ignored in this fork: consumers install this
+# package via `git+https://...` (not from the npm registry), and the JS bundle
+# is required at install time. Upstream capgo builds dist/ during `npm publish`,
+# but git URL installs skip that step — so we commit the build artifacts here.
 node_modules
 
 # iOS files
