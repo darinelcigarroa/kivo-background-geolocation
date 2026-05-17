@@ -7,6 +7,7 @@ import type {
   CallbackError,
   SetPlannedRouteOptions,
   GeofenceSetupOptions,
+  LocationUploadOptions,
   AddGeofenceOptions,
   RemoveGeofenceOptions,
   MonitoredGeofencesResult,
@@ -38,6 +39,14 @@ export class BackgroundGeolocationWeb extends WebPlugin implements BackgroundGeo
   private geofencePayload: Record<string, unknown> = {};
   private notifyOnEntry = true;
   private notifyOnExit = true;
+
+  // KIVO fork: location upload state (web fallback). On web there's no
+  // WebView throttling problem, so we just fetch directly from the watcher.
+  private uploadUrl: string | undefined;
+  private uploadHeaders: Record<string, string> = {};
+  private uploadCommonPayload: Record<string, unknown> = {};
+  private uploadMinIntervalMs = 5000;
+  private uploadLastSentAt = 0;
 
   async start(options: StartOptions, callback: (position?: Location, error?: CallbackError) => void): Promise<void> {
     if (!navigator.geolocation) {
@@ -80,6 +89,7 @@ export class BackgroundGeolocationWeb extends WebPlugin implements BackgroundGeo
           this.isOffRoute = offRoute;
         }
         this.checkGeofences(position.coords.latitude, position.coords.longitude);
+        this.maybeUploadLocation(location);
         callback(location);
       },
       (error) => {
@@ -132,6 +142,50 @@ export class BackgroundGeolocationWeb extends WebPlugin implements BackgroundGeo
     this.notifyOnEntry = options.notifyOnEntry ?? true;
     this.notifyOnExit = options.notifyOnExit ?? true;
     this.geofencePayload = options.payload ?? {};
+  }
+
+  async configureUpload(options: LocationUploadOptions): Promise<void> {
+    if (!options.url) {
+      throw new Error('url is required');
+    }
+    new URL(options.url);
+    this.uploadUrl = options.url;
+    this.uploadHeaders = options.headers ?? {};
+    this.uploadCommonPayload = options.commonPayload ?? {};
+    this.uploadMinIntervalMs = options.minIntervalMs && options.minIntervalMs > 0 ? options.minIntervalMs : 5000;
+    this.uploadLastSentAt = 0;
+  }
+
+  async clearUpload(): Promise<void> {
+    this.uploadUrl = undefined;
+    this.uploadHeaders = {};
+    this.uploadCommonPayload = {};
+    this.uploadLastSentAt = 0;
+  }
+
+  private maybeUploadLocation(location: Location): void {
+    if (!this.uploadUrl) {
+      return;
+    }
+    const now = Date.now();
+    if (now - this.uploadLastSentAt < this.uploadMinIntervalMs) {
+      return;
+    }
+    this.uploadLastSentAt = now;
+    const body = JSON.stringify({
+      ...this.uploadCommonPayload,
+      ...location,
+      enqueuedAt: now,
+    });
+    void fetch(this.uploadUrl, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        ...this.uploadHeaders,
+      },
+      body,
+    }).catch(() => undefined);
   }
 
   async addGeofence(options: AddGeofenceOptions): Promise<void> {

@@ -185,6 +185,9 @@ public class BackgroundGeolocationService extends Service {
                     }
                     isOffRoute = offRoute;
                 }
+                // KIVO fork: native POST (survives WebView throttling on Xiaomi/HyperOS).
+                // No-op until JS calls configureUpload(...) to provide URL + headers.
+                LocationUploadStore.enqueueUpload(getApplicationContext(), location);
                 Intent intent = new Intent(ACTION_BROADCAST);
                 intent.putExtra("location", location);
                 intent.putExtra("id", callbackId);

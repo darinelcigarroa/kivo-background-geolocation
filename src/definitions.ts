@@ -277,6 +277,51 @@ export interface GeofenceSetupOptions {
 }
 
 /**
+ * KIVO fork addition. Options for configuring continuous native HTTP upload
+ * of every location fix while the watcher is active.
+ *
+ * Unlike the JS callback path (which can be throttled by aggressive Android
+ * OEMs when the WebView is suspended), uploads configured here run entirely
+ * in native code via WorkManager (Android) / URLSession + SQLite queue (iOS),
+ * so pings keep flowing while the app is backgrounded.
+ *
+ * @since 8.0.35-kivo.0
+ */
+export interface LocationUploadOptions {
+  /**
+   * Endpoint that receives each location fix as a JSON `POST`.
+   *
+   * @example "https://api.example.com/driver/location"
+   */
+  url: string;
+
+  /**
+   * Optional HTTP headers added to every upload (e.g. `Authorization` for JWT).
+   *
+   * Call `configureUpload` again with refreshed headers when the token rotates.
+   *
+   * @example { "Authorization": "Bearer eyJhbGciOi..." }
+   */
+  headers?: Record<string, string>;
+
+  /**
+   * Optional static JSON merged into every upload body (e.g. service/trip id).
+   *
+   * @example { "serviceId": 123 }
+   */
+  commonPayload?: Record<string, unknown>;
+
+  /**
+   * Minimum interval in milliseconds between native uploads. Acts as a
+   * throttle so the backend isn't flooded when the GPS chip fires rapidly.
+   *
+   * @default 5000
+   * @example 5000
+   */
+  minIntervalMs?: number;
+}
+
+/**
  * A circular geofence region.
  *
  * @since 8.0.30
@@ -567,6 +612,43 @@ export interface BackgroundGeolocationPlugin {
    * });
    */
   setupGeofencing(options: GeofenceSetupOptions): Promise<void>;
+
+  /**
+   * KIVO fork addition. Configures the native HTTP upload pipeline for
+   * continuous location pings. Every fix delivered by the watcher is POSTed
+   * from native code (WorkManager on Android, URLSession on iOS), bypassing
+   * the WebView path that aggressive OEMs throttle in background.
+   *
+   * Call once when the tracked trip starts (after `start`). Call again with
+   * refreshed headers when an auth token rotates. Call `clearUpload` when
+   * the trip ends.
+   *
+   * @param options Upload configuration
+   * @returns A promise that resolves once the configuration is persisted
+   *
+   * @since 8.0.35-kivo.0
+   * @example
+   * await BackgroundGeolocation.configureUpload({
+   *   url: "https://api.kivo.mx/services/42/location",
+   *   headers: { Authorization: `Bearer ${token}` },
+   *   commonPayload: { serviceId: 42, driverId: 7 },
+   *   minIntervalMs: 5000,
+   * });
+   */
+  configureUpload(options: LocationUploadOptions): Promise<void>;
+
+  /**
+   * KIVO fork addition. Clears the native HTTP upload configuration. After
+   * this call, the watcher stops emitting native POSTs (JS callback continues
+   * unaffected). Call this when the tracked trip ends.
+   *
+   * @returns A promise that resolves once the configuration is cleared
+   *
+   * @since 8.0.35-kivo.0
+   * @example
+   * await BackgroundGeolocation.clearUpload();
+   */
+  clearUpload(): Promise<void>;
 
   /**
    * Starts monitoring a circular native geofence.

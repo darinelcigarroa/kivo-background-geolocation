@@ -47,6 +47,8 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
         CAPPluginMethod(name: "openSettings", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setPlannedRoute", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setupGeofencing", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "configureUpload", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "clearUpload", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "addGeofence", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "removeGeofence", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "removeAllGeofences", returnType: CAPPluginReturnPromise),
@@ -79,12 +81,27 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
     private let geofencePayloadKey = "CapgoBackgroundGeolocation.geofence.payload"
     private let geofenceRegionPrefix = "CapgoBackgroundGeolocation.geofence.region."
 
+    // KIVO fork: continuous location upload state
+    private var uploadUrl: URL?
+    private var uploadHeaders: [String: String] = [:]
+    private var uploadCommonPayload: [String: Any] = [:]
+    private var uploadMinIntervalMs: Int = 5000
+    private var uploadLastSentAt: TimeInterval = 0
+    private let uploadQueueSerial = DispatchQueue(label: "kivo.background-geolocation.upload")
+    private let uploadUrlKey = "KivoBackgroundGeolocation.upload.url"
+    private let uploadHeadersKey = "KivoBackgroundGeolocation.upload.headers"
+    private let uploadPayloadKey = "KivoBackgroundGeolocation.upload.commonPayload"
+    private let uploadMinIntervalKey = "KivoBackgroundGeolocation.upload.minIntervalMs"
+    private let uploadPendingKey = "KivoBackgroundGeolocation.upload.pendingQueue"
+    private let uploadMaxQueueSize = 200
+
     // Earth radius in meters for distance calculations
     private static let earthRadiusMeters: Double = 6371000.0
 
     @objc override public func load() {
         UIDevice.current.isBatteryMonitoringEnabled = true
         restoreGeofenceConfiguration()
+        restoreUploadConfiguration()
         DispatchQueue.main.async {
             _ = self.ensureGeofenceLocationManager()
         }
@@ -313,6 +330,54 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
                 return call.reject("Always location permission is required for geofencing", "NOT_AUTHORIZED")
             }
             self.requestGeofenceAlwaysAuthorization(call, manager: manager, status: status)
+        }
+    }
+
+    // KIVO fork: configure continuous native HTTP upload of location fixes.
+    @objc func configureUpload(_ call: CAPPluginCall) {
+        guard let urlString = call.getString("url"), !urlString.isEmpty,
+              let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme) else {
+            return call.reject("url is required and must be http(s)")
+        }
+        let headersRaw = call.getObject("headers") ?? [:]
+        var headers: [String: String] = [:]
+        for (key, value) in headersRaw {
+            if let stringValue = value as? String {
+                headers[key] = stringValue
+            }
+        }
+        let commonPayload = call.getObject("commonPayload") ?? [:]
+        guard JSONSerialization.isValidJSONObject(commonPayload) else {
+            return call.reject("commonPayload must be valid JSON")
+        }
+        let minInterval = call.getInt("minIntervalMs") ?? 5000
+
+        uploadQueueSerial.async {
+            self.uploadUrl = url
+            self.uploadHeaders = headers
+            self.uploadCommonPayload = commonPayload
+            self.uploadMinIntervalMs = minInterval > 0 ? minInterval : 5000
+            self.uploadLastSentAt = 0
+            self.persistUploadConfiguration()
+            call.resolve()
+        }
+    }
+
+    @objc func clearUpload(_ call: CAPPluginCall) {
+        uploadQueueSerial.async {
+            self.uploadUrl = nil
+            self.uploadHeaders = [:]
+            self.uploadCommonPayload = [:]
+            self.uploadLastSentAt = 0
+            let defaults = UserDefaults.standard
+            defaults.removeObject(forKey: self.uploadUrlKey)
+            defaults.removeObject(forKey: self.uploadHeadersKey)
+            defaults.removeObject(forKey: self.uploadPayloadKey)
+            defaults.removeObject(forKey: self.uploadMinIntervalKey)
+            defaults.removeObject(forKey: self.uploadPendingKey)
+            call.resolve()
         }
     }
 
@@ -582,6 +647,147 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
         }.resume()
     }
 
+    // KIVO fork: continuous location upload pipeline ----------------------
+
+    private func persistUploadConfiguration() {
+        let defaults = UserDefaults.standard
+        defaults.set(uploadUrl?.absoluteString, forKey: uploadUrlKey)
+        if let headersData = try? JSONSerialization.data(withJSONObject: uploadHeaders) {
+            defaults.set(headersData, forKey: uploadHeadersKey)
+        }
+        if JSONSerialization.isValidJSONObject(uploadCommonPayload),
+           let payloadData = try? JSONSerialization.data(withJSONObject: uploadCommonPayload) {
+            defaults.set(payloadData, forKey: uploadPayloadKey)
+        } else {
+            defaults.removeObject(forKey: uploadPayloadKey)
+        }
+        defaults.set(uploadMinIntervalMs, forKey: uploadMinIntervalKey)
+    }
+
+    private func restoreUploadConfiguration() {
+        let defaults = UserDefaults.standard
+        if let urlString = defaults.string(forKey: uploadUrlKey), !urlString.isEmpty {
+            uploadUrl = URL(string: urlString)
+        }
+        if let headersData = defaults.data(forKey: uploadHeadersKey),
+           let headers = try? JSONSerialization.jsonObject(with: headersData) as? [String: String] {
+            uploadHeaders = headers
+        }
+        if let payloadData = defaults.data(forKey: uploadPayloadKey),
+           let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] {
+            uploadCommonPayload = payload
+        }
+        if defaults.object(forKey: uploadMinIntervalKey) != nil {
+            let stored = defaults.integer(forKey: uploadMinIntervalKey)
+            uploadMinIntervalMs = stored > 0 ? stored : 5000
+        }
+    }
+
+    // Called from locationManager(_:didUpdateLocations:) for every fix.
+    // Throttles by minIntervalMs and dispatches the POST off the main thread.
+    private func maybeUploadLocation(_ location: CLLocation) {
+        guard uploadUrl != nil else { return }
+        let now = Date().timeIntervalSince1970 * 1000
+        if now - uploadLastSentAt < Double(uploadMinIntervalMs) {
+            return
+        }
+        uploadLastSentAt = now
+
+        var payload: [String: Any] = uploadCommonPayload
+        for (key, value) in formatLocation(location) {
+            payload[key] = value
+        }
+        payload["enqueuedAt"] = Int(now)
+
+        uploadQueueSerial.async {
+            self.drainPendingUploads()
+            self.performUpload(payload)
+        }
+    }
+
+    private func performUpload(_ payload: [String: Any]) {
+        guard let url = uploadUrl,
+              JSONSerialization.isValidJSONObject(payload),
+              let body = try? JSONSerialization.data(withJSONObject: payload) else {
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.addValue("application/json", forHTTPHeaderField: "Accept")
+        for (key, value) in uploadHeaders {
+            request.addValue(value, forHTTPHeaderField: key)
+        }
+        request.httpBody = body
+
+        var backgroundTask = UIBackgroundTaskIdentifier.invalid
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "KivoLocationUpload") {
+            if backgroundTask != .invalid {
+                UIApplication.shared.endBackgroundTask(backgroundTask)
+                backgroundTask = .invalid
+            }
+        }
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+            defer {
+                if backgroundTask != .invalid {
+                    UIApplication.shared.endBackgroundTask(backgroundTask)
+                    backgroundTask = .invalid
+                }
+            }
+            guard let self = self else { return }
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if statusCode == 401 || statusCode == 403 || statusCode == 404 {
+                // Auth/resource-gone — purge config so we stop trying.
+                self.uploadQueueSerial.async {
+                    self.uploadUrl = nil
+                    let defaults = UserDefaults.standard
+                    defaults.removeObject(forKey: self.uploadUrlKey)
+                    defaults.removeObject(forKey: self.uploadPendingKey)
+                }
+                return
+            }
+            if error != nil || statusCode < 200 || statusCode >= 300 {
+                self.uploadQueueSerial.async {
+                    self.enqueuePendingUpload(payload)
+                }
+            }
+        }.resume()
+    }
+
+    private func enqueuePendingUpload(_ payload: [String: Any]) {
+        var pending = pendingUploads()
+        pending.append(payload)
+        if pending.count > uploadMaxQueueSize {
+            pending = Array(pending.suffix(uploadMaxQueueSize))
+        }
+        if JSONSerialization.isValidJSONObject(pending),
+           let data = try? JSONSerialization.data(withJSONObject: pending) {
+            UserDefaults.standard.set(data, forKey: uploadPendingKey)
+        }
+    }
+
+    private func pendingUploads() -> [[String: Any]] {
+        guard let data = UserDefaults.standard.data(forKey: uploadPendingKey),
+              let queue = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+        return queue
+    }
+
+    // Pop one pending upload and retry it. Called before each new fix to keep
+    // queue size bounded under sustained offline periods.
+    private func drainPendingUploads() {
+        guard uploadUrl != nil else { return }
+        var pending = pendingUploads()
+        guard !pending.isEmpty else { return }
+        let next = pending.removeFirst()
+        if JSONSerialization.isValidJSONObject(pending),
+           let data = try? JSONSerialization.data(withJSONObject: pending) {
+            UserDefaults.standard.set(data, forKey: uploadPendingKey)
+        }
+        performUpload(next)
+    }
+
     private func startUpdatingLocation() {
         // Avoid unnecessary calls to startUpdatingLocation, which can
         // result in extraneous invocations of didFailWithError.
@@ -745,6 +951,9 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
 
         if isLocationValid(location) {
             checkRouteDeviation(location)
+            // KIVO fork: native POST (bypasses WebView throttling). No-op until
+            // JS calls configureUpload(...) to provide URL + headers.
+            maybeUploadLocation(location)
             return call.resolve(formatLocation(location))
         }
     }

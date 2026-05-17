@@ -251,6 +251,45 @@ public class BackgroundGeolocation extends Plugin {
             });
     }
 
+    // KIVO fork addition. Configures the native HTTP upload pipeline. Every
+    // location fix that arrives in BackgroundGeolocationService is enqueued
+    // through WorkManager and POSTed by LocationUploadWorker — fully native,
+    // so the JS / WebView path can be throttled by the OS without losing pings.
+    //
+    // Call once when a trip starts; call clearUpload() when it ends.
+    @PluginMethod
+    public void configureUpload(PluginCall call) {
+        String url = call.getString("url");
+        if (url == null || url.isEmpty()) {
+            call.reject("url is required");
+            return;
+        }
+        try {
+            URL urlObject = new URL(url);
+            String protocol = urlObject.getProtocol();
+            if (!"http".equalsIgnoreCase(protocol) && !"https".equalsIgnoreCase(protocol)) {
+                call.reject("Given url is not valid");
+                return;
+            }
+        } catch (Exception exception) {
+            call.reject("Given url is not valid");
+            return;
+        }
+
+        JSObject headers = call.getObject("headers", new JSObject());
+        JSObject commonPayload = call.getObject("commonPayload", new JSObject());
+        int minIntervalMs = call.getInt("minIntervalMs", 5000);
+
+        LocationUploadStore.saveSetup(getContext(), url, headers, commonPayload, minIntervalMs);
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void clearUpload(PluginCall call) {
+        LocationUploadStore.clear(getContext());
+        call.resolve();
+    }
+
     @PluginMethod
     public void addGeofence(PluginCall call) {
         boolean backgroundLocation = GeofenceStore.getBackgroundLocation(getContext());
