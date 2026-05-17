@@ -693,11 +693,23 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
         }
         uploadLastSentAt = now
 
+        // Compact KIVO-style schema (lat/lng/heading) — matches the backend
+        // validator at ServiceController::updateLocation. The JS-facing
+        // `formatLocation` keeps the upstream capgo shape (latitude/longitude/
+        // bearing) for the JS callback, so we build a separate payload here.
         var payload: [String: Any] = uploadCommonPayload
-        for (key, value) in formatLocation(location) {
-            payload[key] = value
+        payload["lat"] = location.coordinate.latitude
+        payload["lng"] = location.coordinate.longitude
+        if location.horizontalAccuracy >= 0 {
+            payload["accuracy"] = location.horizontalAccuracy
         }
-        payload["enqueuedAt"] = Int(now)
+        if location.speed >= 0 {
+            payload["speed"] = location.speed
+        }
+        if location.course >= 0 {
+            payload["heading"] = location.course
+        }
+        payload["reason"] = "native"
 
         uploadQueueSerial.async {
             self.drainPendingUploads()

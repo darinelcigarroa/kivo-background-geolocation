@@ -162,16 +162,21 @@ final class LocationUploadStore {
             String key = keys.next();
             payload.put(key, common.get(key));
         }
-        payload.put("latitude", location.getLatitude());
-        payload.put("longitude", location.getLongitude());
-        payload.put("accuracy", location.getAccuracy());
-        payload.put("altitude", location.hasAltitude() ? location.getAltitude() : JSONObject.NULL);
-        payload.put("altitudeAccuracy", JSONObject.NULL);
-        payload.put("simulated", location.isFromMockProvider());
-        payload.put("speed", location.hasSpeed() ? location.getSpeed() : JSONObject.NULL);
-        payload.put("bearing", location.hasBearing() ? location.getBearing() : JSONObject.NULL);
-        payload.put("time", location.getTime());
-        payload.put("enqueuedAt", timestampMs);
+        // Compact KIVO-style schema. Note that we send `lat`/`lng`/`heading`
+        // (not `latitude`/`longitude`/`bearing` like the upstream capgo plugin)
+        // to match the backend validator at ServiceController::updateLocation.
+        payload.put("lat", location.getLatitude());
+        payload.put("lng", location.getLongitude());
+        if (location.hasAccuracy()) {
+            payload.put("accuracy", location.getAccuracy());
+        }
+        if (location.hasSpeed()) {
+            payload.put("speed", location.getSpeed());
+        }
+        if (location.hasBearing()) {
+            payload.put("heading", location.getBearing());
+        }
+        payload.put("reason", "native");
         return payload;
     }
 
